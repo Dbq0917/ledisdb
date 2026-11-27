@@ -160,16 +160,20 @@ func (db *DB) Exists(key []byte) (int64, error) {
 		return 0, err
 	}
 
-	var err error
-	key = db.encodeKVKey(key)
-
-	var v []byte
-	v, err = db.bucket.Get(key)
-	if v != nil && err == nil {
-		return 1, nil
+	now := time.Now().Unix()
+	if db.lazyExpire(KVType, key, now) {
+		return 0, nil
 	}
 
-	return 0, err
+	ek := db.encodeKVKey(key)
+	v, err := db.bucket.Get(ek)
+	if err != nil {
+		return 0, err
+	}
+	if v == nil {
+		return 0, nil
+	}
+	return 1, nil
 }
 
 // Get gets the value.
@@ -178,9 +182,14 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 		return nil, err
 	}
 
-	key = db.encodeKVKey(key)
+	now := time.Now().Unix()
+	if db.lazyExpire(KVType, key, now) {
+		return nil, nil
+	}
 
-	return db.bucket.Get(key)
+	ek := db.encodeKVKey(key)
+
+	return db.bucket.Get(ek)
 }
 
 // GetSlice gets the slice of the data.
@@ -189,9 +198,14 @@ func (db *DB) GetSlice(key []byte) (store.Slice, error) {
 		return nil, err
 	}
 
-	key = db.encodeKVKey(key)
+	now := time.Now().Unix()
+	if db.lazyExpire(KVType, key, now) {
+		return nil, nil
+	}
 
-	return db.bucket.GetSlice(key)
+	ek := db.encodeKVKey(key)
+
+	return db.bucket.GetSlice(ek)
 }
 
 // GetSet gets the value and sets new value.
@@ -238,12 +252,20 @@ func (db *DB) MGet(keys ...[]byte) ([][]byte, error) {
 	it := db.bucket.NewIterator()
 	defer it.Close()
 
+	now := time.Now().Unix()
+
 	for i := range keys {
 		if err := checkKeySize(keys[i]); err != nil {
 			return nil, err
 		}
 
-		values[i] = it.Find(db.encodeKVKey(keys[i]))
+		ek := db.encodeKVKey(keys[i])
+		if db.lazyExpire(KVType, keys[i], now) {
+			it.Find(ek)
+			values[i] = nil
+		} else {
+			values[i] = it.Find(ek)
+		}
 	}
 
 	return values, nil

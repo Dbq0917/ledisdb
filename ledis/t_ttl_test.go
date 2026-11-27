@@ -1,11 +1,14 @@
 package ledis
 
 import (
+	"bytes"
 	"fmt"
+	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/ledisdb/ledisdb/config"
 	"github.com/siddontang/go/hack"
 )
 
@@ -461,4 +464,126 @@ func TestTTLCodec(t *testing.T) {
 		t.Fatal(string(k))
 	}
 
+}
+
+func openExpireTestLedis(t *testing.T, dataDir string, readonly bool) *Ledis {
+	cfg := config.NewConfigDefault()
+	cfg.DataDir = dataDir
+	cfg.UseReplication = true
+	cfg.Readonly = readonly
+
+	os.RemoveAll(dataDir)
+
+	l, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return l
+}
+
+func syncExpireTestLogs(t *testing.T, master, slave *Ledis, startID uint64) uint64 {
+	var buf bytes.Buffer
+	id := startID
+	for {
+		buf.Reset()
+		n, nextID, err := master.ReadLogsTo(id, &buf)
+		if err != nil {
+			t.Fatal(err)
+		} else if n != 0 {
+			if err = slave.StoreLogsFromReader(&buf); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			return id
+		}
+		id = nextID
+	}
+}
+
+// TestLazyExpireOnRead covers the read-path expiration: a key past its ttl must
+// be reported as missing on both the master and a read-only slave, even though
+// the slave never runs the background ttl cleanup itself.
+func TestLazyExpireOnRead(t *testing.T) {
+	master := openExpireTestLedis(t, "/tmp/test_lazy_expire/master", false)
+	defer master.Close()
+
+	slave := openExpireTestLedis(t, "/tmp/test_lazy_expire/slave", true)
+	defer slave.Close()
+
+	if !slave.IsReadOnly() {
+		t.Fatal("slave must be read only")
+	}
+
+	mdb, _ := master.Select(0)
+	sdb, _ := slave.Select(0)
+
+	key := []byte("lazy_expire_key")
+	value := []byte("lazy_expire_value")
+
+	if err := mdb.SetEX(key, 3, value); err != nil {
+		t.Fatal(err)
+	}
+
+	nextID := syncExpireTestLogs(t, master, slave, 1)
+	if err := slave.WaitReplication(); err != nil {
+		t.Fatal(err)
+	}
+
+	if v, err := mdb.Get(key); err != nil || !bytes.Equal(v, value) {
+		t.Fatalf("master get before expire: %q, %v", v, err)
+	}
+	if v, err := sdb.Get(key); err != nil || !bytes.Equal(v, value) {
+		t.Fatalf("slave get before expire: %q, %v", v, err)
+	}
+
+	time.Sleep(4 * time.Second)
+
+	// read once from the master
+	if v, err := mdb.Get(key); err != nil || v != nil {
+		t.Fatalf("master get after expire should miss, got %q, err %v", v, err)
+	}
+	if n, err := mdb.Exists(key); err != nil || n != 0 {
+		t.Fatalf("master exists after expire should be 0, got %d, err %v", n, err)
+	}
+
+	// read once from the read-only instance, whose ttl checker is skipped
+	if v, err := sdb.Get(key); err != nil || v != nil {
+		t.Fatalf("slave get after expire should miss, got %q, err %v", v, err)
+	}
+	if n, err := sdb.Exists(key); err != nil || n != 0 {
+		t.Fatalf("slave exists after expire should be 0, got %d, err %v", n, err)
+	}
+
+	// the slave must not purge anything on its own
+	mk := mdb.expEncodeMetaKey(KVType, key)
+	if sv, err := sdb.bucket.Get(mk); err != nil {
+		t.Fatal(err)
+	} else if sv == nil {
+		t.Fatal("slave must not delete expire metadata by itself")
+	}
+
+	// an unexpired key still reads normally
+	keepKey := []byte("lazy_expire_keep")
+	if err := mdb.SetEX(keepKey, 3600, value); err != nil {
+		t.Fatal(err)
+	}
+	syncExpireTestLogs(t, master, slave, nextID)
+	if err := slave.WaitReplication(); err != nil {
+		t.Fatal(err)
+	}
+	if v, err := sdb.Get(keepKey); err != nil || !bytes.Equal(v, value) {
+		t.Fatalf("slave get unexpired key: %q, %v", v, err)
+	}
+
+	// wait for the master's async purge to finish before closing the stores
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if v, err := mdb.bucket.Get(mk); err != nil {
+			t.Fatal(err)
+		} else if v == nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("master did not purge the expired key")
 }

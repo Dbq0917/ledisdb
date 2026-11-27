@@ -137,6 +137,58 @@ func (db *DB) rmExpire(t *batch, dataType byte, key []byte) (int64, error) {
 	return 1, nil
 }
 
+// expireWhen returns the expiration time of the key, 0 when no ttl is set.
+func (db *DB) expireWhen(dataType byte, key []byte) (int64, error) {
+	mk := db.expEncodeMetaKey(dataType, key)
+	return Int64(db.bucket.Get(mk))
+}
+
+// lazyExpire checks expiration on the read path. An expired key is treated as
+// missing so that read-only instances (whose background ttl checker is skipped)
+// stop serving stale data without deleting anything themselves. On a writable
+// instance the expired data is purged asynchronously, without blocking the
+// current read on the write batch lock.
+func (db *DB) lazyExpire(dataType byte, key []byte, now int64) bool {
+	when, err := db.expireWhen(dataType, key)
+	if err != nil || when == 0 || when > now {
+		return false
+	}
+
+	if !db.l.IsReadOnly() {
+		go db.purgeExpired(dataType, key)
+	}
+
+	return true
+}
+
+// purgeExpired removes an expired key and its ttl metadata. The re-check under
+// the batch lock avoids deleting data whose expiration was refreshed meanwhile.
+func (db *DB) purgeExpired(dataType byte, key []byte) {
+	now := time.Now().Unix()
+
+	c := db.ttlChecker
+	t := c.txs[dataType]
+	cb := c.cbs[dataType]
+	if t == nil || cb == nil {
+		return
+	}
+
+	t.Lock()
+	defer t.Unlock()
+
+	curWhen, err := db.expireWhen(dataType, key)
+	if err != nil || curWhen == 0 || curWhen > now {
+		return
+	}
+
+	tk := db.expEncodeTimeKey(dataType, key, curWhen)
+	mk := db.expEncodeMetaKey(dataType, key)
+	cb(t, key)
+	t.Delete(tk)
+	t.Delete(mk)
+	t.Commit()
+}
+
 func (c *ttlChecker) register(dataType byte, t *batch, f onExpired) {
 	c.txs[dataType] = t
 	c.cbs[dataType] = f
