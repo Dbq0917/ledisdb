@@ -127,6 +127,12 @@ const (
 	MaxValueSize int = 1024 * 1024 * 1024
 )
 
+// keyEncodingVersion identifies the ledis key/value encoding scheme
+// (data type bytes, db index varint, ttl key format, ...). It must be
+// bumped whenever the encoding changes in an incompatible way, so that
+// a dump created with another encoding is refused on load.
+const keyEncodingVersion uint16 = 1
+
 // For different common errors
 var (
 	ErrScoreMiss     = errors.New("zset score miss")
